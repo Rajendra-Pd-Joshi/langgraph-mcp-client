@@ -1,445 +1,685 @@
-
+from dotenv import load_dotenv
+load_dotenv()
 import asyncio
 import json
+from pathlib import Path
 
 import streamlit as st
-from dotenv import load_dotenv
 
 from fastmcp import Client
+from fastmcp.client.auth import OAuth
+
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from langchain_openai import ChatOpenAI
+
 from langchain_core.messages import (
     SystemMessage,
     HumanMessage,
     AIMessage,
     ToolMessage,
 )
+
 from langchain_core.tools import StructuredTool
+from pydantic import create_model
 
 
 # ============================================================
-# ENVIRONMENT
+# CONFIGURATION
 # ============================================================
 
-load_dotenv()
-
-
-# ============================================================
-# SERVER CONFIGURATION
-# ============================================================
-
-MATH_SERVER = {
-    "mcpServers": {
-        "math": {
-            "transport": "stdio",
-            "command": (
-                r"C:\Users\rajen\AppData\Roaming\Python"
-                r"\Python313\Scripts\uv.exe"
-            ),
-            "args": [
-                "--directory",
-                r"C:\Users\rajen\Desktop\MCP-Math-Server",
-                "run",
-                "fastmcp",
-                "run",
-                r"src\mcp_math_server\main.py",
-            ],
-        }
-    }
-}
-
-
-EXPENSE_SERVER_URL = (
+EXPENSE_MCP_URL = (
     "https://magic-beige-goat.fastmcp.app/mcp"
 )
 
+CALLBACK_PORT = 53030
+
 
 # ============================================================
-# PAGE
+# PATHS
 # ============================================================
 
-st.set_page_config(
-    page_title="MCP Chat",
-    page_icon="🧰",
-    layout="centered",
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+HORIZON_CLIENT_FILE = (
+    BASE_DIR / "horizon_client.json"
 )
 
-st.title("🧰 MCP Chat")
-st.caption("Local Math MCP + Authenticated Horizon Expense MCP")
+MATH_SERVER_DIR = (
+    r"C:\Users\rajen\Desktop\MCP-Math-Server"
+)
+
+UV_PATH = (
+    r"C:\Users\rajen\AppData\Roaming"
+    r"\Python\Python313\Scripts\uv.exe"
+)
 
 
 # ============================================================
-# SYSTEM PROMPT
+# LOAD HORIZON CREDENTIALS
 # ============================================================
 
-SYSTEM_PROMPT = """
-You are an MCP-powered assistant.
+def load_horizon_credentials():
 
-You have access to:
+    if not HORIZON_CLIENT_FILE.exists():
 
-1. A local Math MCP server.
-2. An authenticated Expense MCP server.
+        raise FileNotFoundError(
+            f"\nCould not find:\n"
+            f"{HORIZON_CLIENT_FILE}\n\n"
+            "Make sure horizon_client.json exists."
+        )
 
-Use MCP tools whenever they are needed.
+    with open(
+        HORIZON_CLIENT_FILE,
+        "r",
+        encoding="utf-8",
+    ) as f:
 
-Do not narrate tool execution.
+        credentials = json.load(f)
 
-Do not say:
-- "I am checking..."
-- "Let me calculate..."
-- "I am querying..."
-- "Please wait..."
+    if not credentials.get("client_id"):
 
-After tools finish, provide only the useful final answer.
+        raise ValueError(
+            "client_id is missing from "
+            "horizon_client.json"
+        )
 
-For expense questions:
-- Use the actual Expense MCP tools.
-- Never invent expense data.
+    if not credentials.get("client_secret"):
 
-For mathematical questions:
-- Prefer the Math MCP tools when available.
-"""
+        raise ValueError(
+            "client_secret is missing from "
+            "horizon_client.json"
+        )
+
+    return credentials
 
 
 # ============================================================
-# CREATE MCP CLIENT
+# CREATE REMOTE EXPENSE MCP CLIENT
 # ============================================================
-
-def create_math_client():
-    return Client(MATH_SERVER)
-
 
 def create_expense_client():
+
+    credentials = load_horizon_credentials()
+
+    oauth = OAuth(
+        mcp_url=EXPENSE_MCP_URL,
+
+        client_name=(
+            "Rajendra Expense MCP Client"
+        ),
+
+        client_id=credentials["client_id"],
+
+        client_secret=credentials["client_secret"],
+
+        callback_port=CALLBACK_PORT,
+    )
+
     return Client(
-        EXPENSE_SERVER_URL,
-        auth="oauth",
+        EXPENSE_MCP_URL,
+        auth=oauth,
     )
 
 
 # ============================================================
-# GET MCP TOOLS
+# CREATE LOCAL MATH MCP CLIENT
 # ============================================================
 
-async def get_mcp_tools():
-    """
-    Connect to both MCP servers using the required
-    async context manager and retrieve their tools.
-    """
+def create_math_client():
 
-    math_client = create_math_client()
-    expense_client = create_expense_client()
+    servers = {
+
+        "math": {
+
+            "transport": "stdio",
+
+            "command": UV_PATH,
+
+            "args": [
+
+                "--directory",
+
+                MATH_SERVER_DIR,
+
+                "run",
+
+                "fastmcp",
+
+                "run",
+
+                r"src\mcp_math_server\main.py",
+            ],
+        }
+    }
+
+    return MultiServerMCPClient(
+        servers
+    )
+
+
+# ============================================================
+# CONVERT REMOTE MCP TOOL TO LANGCHAIN TOOL
+# ============================================================
+
+def create_langchain_expense_tool(
+    expense_client,
+    tool_info,
+):
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # FastMCP requires async with client:
+    # Get MCP input schema
     # --------------------------------------------------------
 
-    async with math_client:
-        math_tools = await math_client.list_tools()
+    schema = getattr(
+        tool_info,
+        "inputSchema",
+        None,
+    )
 
-    async with expense_client:
-        expense_tools = await expense_client.list_tools()
+    if schema is None:
 
-    return math_tools, expense_tools
-
-
-# ============================================================
-# MCP TOOL EXECUTOR
-# ============================================================
-
-async def execute_mcp_tool(
-    server_name,
-    tool_name,
-    arguments,
-):
-    """
-    Open a fresh MCP connection for each tool call.
-
-    This avoids keeping an async context alive across
-    Streamlit reruns.
-    """
-
-    if server_name == "math":
-
-        client = create_math_client()
-
-    elif server_name == "expense":
-
-        client = create_expense_client()
-
-    else:
-
-        raise ValueError(
-            f"Unknown MCP server: {server_name}"
+        schema = getattr(
+            tool_info,
+            "input_schema",
+            None,
         )
 
+    if schema is None:
 
-    async with client:
+        schema = {}
 
-        result = await client.call_tool(
-            tool_name,
-            arguments,
+    properties = schema.get(
+        "properties",
+        {},
+    )
+
+    required_fields = schema.get(
+        "required",
+        [],
+    )
+
+    fields = {}
+
+    # --------------------------------------------------------
+    # Convert JSON schema -> Pydantic fields
+    # --------------------------------------------------------
+
+    for field_name, field_info in properties.items():
+
+        field_type = field_info.get(
+            "type",
+            "string",
         )
 
-        return result
+        if field_type == "integer":
 
+            python_type = int
 
-# ============================================================
-# CONVERT MCP TOOL TO LANGCHAIN TOOL
-# ============================================================
+        elif field_type == "number":
 
-def make_langchain_tool(
-    server_name,
-    mcp_tool,
-):
-    """
-    Convert an MCP tool into a LangChain StructuredTool.
-    """
+            python_type = float
 
-    async def tool_function(**kwargs):
+        elif field_type == "boolean":
 
-        result = await execute_mcp_tool(
-            server_name,
-            mcp_tool.name,
+            python_type = bool
+
+        elif field_type == "array":
+
+            python_type = list
+
+        elif field_type == "object":
+
+            python_type = dict
+
+        else:
+
+            python_type = str
+
+        # Required field
+
+        if field_name in required_fields:
+
+            fields[field_name] = (
+                python_type,
+                ...,
+            )
+
+        # Optional field
+
+        else:
+
+            fields[field_name] = (
+                python_type | None,
+                None,
+            )
+
+    # --------------------------------------------------------
+    # Create Pydantic input model
+    # --------------------------------------------------------
+
+    ToolInput = create_model(
+        f"{tool_info.name}Input",
+        **fields,
+    )
+
+    # --------------------------------------------------------
+    # Async tool function
+    # --------------------------------------------------------
+
+    async def call_expense_tool(
+        **kwargs,
+    ):
+
+        result = await expense_client.call_tool(
+            tool_info.name,
             kwargs,
         )
 
         # ----------------------------------------------------
-        # Extract FastMCP result content
+        # MCP CallToolResult
         # ----------------------------------------------------
 
-        if hasattr(result, "content"):
+        if hasattr(
+            result,
+            "content",
+        ):
 
             output = []
 
             for item in result.content:
 
-                if hasattr(item, "text"):
+                if hasattr(
+                    item,
+                    "text",
+                ):
 
-                    output.append(item.text)
+                    output.append(
+                        item.text
+                    )
 
                 else:
 
-                    output.append(str(item))
+                    output.append(
+                        str(item)
+                    )
 
-            return "\n".join(output)
+            return "\n".join(
+                output
+            )
 
         return str(result)
 
-
     # --------------------------------------------------------
-    # MCP JSON schema -> LangChain args schema
+    # LangChain StructuredTool
     # --------------------------------------------------------
 
     return StructuredTool.from_function(
-        coroutine=tool_function,
-        name=mcp_tool.name,
+        coroutine=call_expense_tool,
+
+        name=tool_info.name,
+
         description=(
-            mcp_tool.description
-            or f"MCP tool: {mcp_tool.name}"
+            getattr(
+                tool_info,
+                "description",
+                None,
+            )
+            or
+            f"Expense MCP tool: {tool_info.name}"
         ),
-        args_schema=mcp_tool.inputSchema,
+
+        args_schema=ToolInput,
     )
 
 
 # ============================================================
-# INITIALIZE APPLICATION
+# INITIALIZE ALL MCP TOOLS
 # ============================================================
 
-if "initialized" not in st.session_state:
+async def initialize_mcp():
 
-    with st.spinner(
-        "Connecting to MCP servers..."
-    ):
+    # ========================================================
+    # LOCAL MATH MCP
+    # ========================================================
 
-        math_tools, expense_tools = asyncio.run(
-            get_mcp_tools()
+    math_client = create_math_client()
+
+    math_tools = await math_client.get_tools()
+
+    print(
+        f"Loaded {len(math_tools)} Math MCP tools"
+    )
+
+    # ========================================================
+    # REMOTE EXPENSE MCP
+    # ========================================================
+
+    expense_client = create_expense_client()
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    # Enter FastMCP client context
+    # --------------------------------------------------------
+
+    await expense_client.__aenter__()
+
+    try:
+
+        await expense_client.ping()
+
+        print(
+            "Connected to Remote Expense MCP"
         )
 
+        # ----------------------------------------------------
+        # Get remote tools
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Convert tools
-    # --------------------------------------------------------
+        expense_tools_info = (
+            await expense_client.list_tools()
+        )
 
-    langchain_tools = []
+        print(
+            f"Loaded "
+            f"{len(expense_tools_info)} "
+            f"Expense MCP tools"
+        )
 
+        # ----------------------------------------------------
+        # Convert tools
+        # ----------------------------------------------------
 
-    for tool in math_tools:
+        expense_tools = []
 
-        langchain_tools.append(
-            make_langchain_tool(
-                "math",
-                tool,
+        for tool_info in expense_tools_info:
+
+            tool = create_langchain_expense_tool(
+                expense_client,
+                tool_info,
             )
-        )
 
-
-    for tool in expense_tools:
-
-        langchain_tools.append(
-            make_langchain_tool(
-                "expense",
-                tool,
+            expense_tools.append(
+                tool
             )
+
+        # ----------------------------------------------------
+        # Return everything
+        # ----------------------------------------------------
+
+        return {
+            "math_tools": math_tools,
+
+            "expense_tools": expense_tools,
+
+            "all_tools": (
+                math_tools
+                + expense_tools
+            ),
+
+            "math_client": math_client,
+
+            "expense_client": expense_client,
+        }
+
+    except Exception:
+
+        await expense_client.__aexit__(
+            None,
+            None,
+            None,
         )
 
-
-    # --------------------------------------------------------
-    # Store tools
-    # --------------------------------------------------------
-
-    st.session_state.tools = langchain_tools
+        raise
 
 
-    # --------------------------------------------------------
-    # LLM
-    # --------------------------------------------------------
+# ============================================================
+# STREAMLIT CACHED MCP CONNECTION
+# ============================================================
 
-    st.session_state.llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        max_tokens=1000,
+@st.cache_resource(
+    show_spinner="Connecting to MCP servers..."
+)
+def initialize_mcp_sync():
+
+    return asyncio.run(
+        initialize_mcp()
     )
 
 
-    # --------------------------------------------------------
-    # Bind tools
-    # --------------------------------------------------------
+# ============================================================
+# LOAD MCP
+# ============================================================
 
-    st.session_state.llm_with_tools = (
-        st.session_state.llm.bind_tools(
-            st.session_state.tools
-        )
+try:
+
+    mcp_data = initialize_mcp_sync()
+
+    MCP_TOOLS = mcp_data["all_tools"]
+
+except Exception as e:
+
+    st.error(
+        "Failed to connect to MCP servers."
+    )
+
+    st.exception(e)
+
+    st.stop()
+
+
+# ============================================================
+# LLM
+# ============================================================
+
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+)
+
+
+# ============================================================
+# LLM WITH MCP TOOLS
+# ============================================================
+
+llm_with_tools = llm.bind_tools(
+    MCP_TOOLS
+)
+
+
+# ============================================================
+# STREAMLIT PAGE
+# ============================================================
+
+st.set_page_config(
+    page_title="MCP AI Assistant",
+    page_icon="🤖",
+    layout="centered",
+)
+
+
+st.title(
+    "🤖 MCP AI Assistant"
+)
+
+st.caption(
+    "GPT-4o-mini + Local Math MCP + Remote Expense MCP"
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.header(
+        "MCP Servers"
+    )
+
+    st.success(
+        "🧮 Math MCP"
+    )
+
+    st.success(
+        "💰 Expense MCP"
+    )
+
+    st.divider()
+
+    st.write(
+        f"Connected tools: {len(MCP_TOOLS)}"
+    )
+
+    st.write(
+        "Remote server:"
+    )
+
+    st.code(
+        EXPENSE_MCP_URL
     )
 
 
-    # --------------------------------------------------------
-    # Conversation history
-    # --------------------------------------------------------
+# ============================================================
+# CHAT HISTORY
+# ============================================================
 
-    st.session_state.history = [
+if "messages" not in st.session_state:
+
+    st.session_state.messages = [
+
         SystemMessage(
-            content=SYSTEM_PROMPT
+            content=(
+                "You are a helpful AI assistant "
+                "with access to two MCP servers.\n\n"
+
+                "Math MCP provides mathematical "
+                "operations such as addition, "
+                "subtraction, multiplication, "
+                "division and modulo.\n\n"
+
+                "Expense MCP provides expense "
+                "tracking functionality.\n\n"
+
+                "Use MCP tools whenever they are "
+                "appropriate for the user's request."
+            )
         )
     ]
 
 
-    st.session_state.initialized = True
-
-
 # ============================================================
-# DISPLAY PREVIOUS MESSAGES
+# DISPLAY CHAT HISTORY
 # ============================================================
 
-for msg in st.session_state.history:
+for message in st.session_state.messages:
 
-    if isinstance(msg, HumanMessage):
+    if isinstance(
+        message,
+        HumanMessage,
+    ):
 
-        with st.chat_message("user"):
-            st.markdown(msg.content)
+        with st.chat_message(
+            "user"
+        ):
 
+            st.write(
+                message.content
+            )
 
-    elif isinstance(msg, AIMessage):
+    elif isinstance(
+        message,
+        AIMessage,
+    ):
 
-        # Don't display intermediate tool calls
-        if getattr(msg, "tool_calls", None):
-            continue
+        if message.content:
 
-        if msg.content:
+            with st.chat_message(
+                "assistant"
+            ):
 
-            with st.chat_message("assistant"):
-                st.markdown(msg.content)
+                st.write(
+                    message.content
+                )
 
 
 # ============================================================
 # CHAT INPUT
 # ============================================================
 
-user_text = st.chat_input(
-    "Ask something..."
+user_input = st.chat_input(
+    "Ask me anything..."
 )
 
 
-if user_text:
+# ============================================================
+# PROCESS USER MESSAGE
+# ============================================================
+
+if user_input:
 
     # --------------------------------------------------------
     # Display user message
     # --------------------------------------------------------
 
-    with st.chat_message("user"):
-        st.markdown(user_text)
+    with st.chat_message(
+        "user"
+    ):
 
+        st.write(
+            user_input
+        )
 
     # --------------------------------------------------------
-    # Store user message
+    # Add to history
     # --------------------------------------------------------
 
-    st.session_state.history.append(
+    st.session_state.messages.append(
         HumanMessage(
-            content=user_text
+            content=user_input
         )
     )
 
 
     # ========================================================
-    # FIRST LLM CALL
+    # ASYNC AGENT
     # ========================================================
 
-    first_response = asyncio.run(
-        st.session_state.llm_with_tools.ainvoke(
-            st.session_state.history
-        )
-    )
+    async def process_message():
 
+        # ----------------------------------------------------
+        # First LLM call
+        # ----------------------------------------------------
 
-    # ========================================================
-    # CHECK TOOL CALLS
-    # ========================================================
-
-    tool_calls = getattr(
-        first_response,
-        "tool_calls",
-        None,
-    )
-
-
-    # ========================================================
-    # NORMAL RESPONSE
-    # ========================================================
-
-    if not tool_calls:
-
-        with st.chat_message("assistant"):
-
-            st.markdown(
-                first_response.content or ""
+        response = (
+            await llm_with_tools.ainvoke(
+                st.session_state.messages
             )
+        )
+
+        # ----------------------------------------------------
+        # No tools needed
+        # ----------------------------------------------------
+
+        if not response.tool_calls:
+
+            return response
 
 
-        st.session_state.history.append(
-            first_response
+        # ----------------------------------------------------
+        # Save AI tool-call message
+        # ----------------------------------------------------
+
+        st.session_state.messages.append(
+            response
         )
 
 
-    # ========================================================
-    # MCP TOOL CALL
-    # ========================================================
-
-    else:
-
         # ----------------------------------------------------
-        # Store AI tool-call message
+        # Execute every requested tool
         # ----------------------------------------------------
 
-        st.session_state.history.append(
-            first_response
-        )
-
-
-        # ----------------------------------------------------
-        # Execute tools
-        # ----------------------------------------------------
-
-        for tool_call in tool_calls:
+        for tool_call in response.tool_calls:
 
             tool_name = tool_call["name"]
 
@@ -448,115 +688,114 @@ if user_text:
                 {},
             )
 
-
-            # ------------------------------------------------
-            # Find LangChain tool
-            # ------------------------------------------------
+            # Find LangChain MCP tool
 
             selected_tool = None
 
-            for tool in st.session_state.tools:
+            for tool in MCP_TOOLS:
 
                 if tool.name == tool_name:
 
                     selected_tool = tool
+
                     break
 
+            # ------------------------------------------------
+            # Tool not found
+            # ------------------------------------------------
 
             if selected_tool is None:
 
-                result_text = json.dumps(
-                    {
-                        "error": (
-                            f"Tool '{tool_name}' "
-                            "was not found."
-                        )
-                    }
+                tool_result = (
+                    f"Tool '{tool_name}' "
+                    "was not found."
                 )
 
             else:
 
                 try:
 
-                    tool_result = asyncio.run(
-                        selected_tool.ainvoke(
+                    tool_result = (
+                        await selected_tool.ainvoke(
                             tool_args
                         )
                     )
 
-
-                    # ----------------------------------------
-                    # Normalize result
-                    # ----------------------------------------
-
-                    if isinstance(
-                        tool_result,
-                        str,
-                    ):
-
-                        result_text = tool_result
-
-                    else:
-
-                        result_text = json.dumps(
-                            tool_result,
-                            default=str,
-                        )
-
-
                 except Exception as e:
 
-                    result_text = json.dumps(
-                        {
-                            "error": str(e)
-                        }
+                    tool_result = (
+                        f"Tool execution failed: {e}"
                     )
 
-
             # ------------------------------------------------
-            # Add MCP result
+            # Add tool result
             # ------------------------------------------------
 
-            st.session_state.history.append(
+            st.session_state.messages.append(
+
                 ToolMessage(
-                    content=result_text,
-                    tool_call_id=tool_call["id"],
+
+                    content=str(
+                        tool_result
+                    ),
+
+                    tool_call_id=(
+                        tool_call["id"]
+                    ),
                 )
             )
 
 
-        # ====================================================
-        # FINAL LLM RESPONSE
-        # ====================================================
+        # ----------------------------------------------------
+        # Final LLM response
+        # ----------------------------------------------------
 
-        final_response = asyncio.run(
-            st.session_state.llm.ainvoke(
-                st.session_state.history
+        final_response = (
+            await llm_with_tools.ainvoke(
+                st.session_state.messages
             )
         )
 
-
-        # ----------------------------------------------------
-        # Display final answer
-        # ----------------------------------------------------
-
-        with st.chat_message("assistant"):
-
-            st.markdown(
-                final_response.content or ""
-            )
+        return final_response
 
 
-        # ----------------------------------------------------
-        # Store final answer
-        # ----------------------------------------------------
+    # ========================================================
+    # EXECUTE
+    # ========================================================
 
-        st.session_state.history.append(
-            AIMessage(
-                content=(
-                    final_response.content
-                    or ""
+    try:
+
+        with st.chat_message(
+            "assistant"
+        ):
+
+            with st.spinner(
+                "Thinking..."
+            ):
+
+                final_response = (
+                    asyncio.run(
+                        process_message()
+                    )
                 )
+
+            st.write(
+                final_response.content
             )
+
+        # ----------------------------------------------------
+        # Save final response
+        # ----------------------------------------------------
+
+        st.session_state.messages.append(
+            final_response
         )
+
+    except Exception as e:
+
+        st.error(
+            "Error while processing request:"
+        )
+
+        st.exception(e)
 

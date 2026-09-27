@@ -1,2 +1,10 @@
 .venv/
 .env
+horizon_client.json
+horizon_client.json
+horizon_oauth/
+.env
+horizon_client.json
+chatbot.db
+chatbot.db-shm
+chatbot.db-wal
